@@ -1,5 +1,4 @@
-This is the complete original code for the paper "_BFSSFormer: Fast Spatial-Spectral Classification of Hyperspectral Image with Band 
-Fusion and Secondary Screening Transformer_" 
+This is the complete original code for the paper "BFSSFormer: Band Fusion and Secondary Screening Transformer for Classifying Spatial-Spectral Features of Hyperspectral Images" 
 We hope it proves helpful to readers. Should you encounter any issues regarding code execution or usage, 
 please contact: liuxuan@htu.edu.cn
 We have uploaded all the datasets from the paper to Baidu Netdisk:
