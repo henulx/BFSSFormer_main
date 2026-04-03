@@ -1,13 +1,15 @@
-import PIL
-import time
-import math
 import torch
 import torchvision
+import numpy as np
 import torch.nn.functional as F
 from einops import rearrange
 from torch import nn
-# from thop import profile
+from thop import profile
 import torch.nn.init as init
+from pytorch_grad_cam import GradCAM
+from pytorch_grad_cam.utils.image import show_cam_on_image
+import cv2
+from torchvision.transforms import Compose, Normalize, ToTensor
 
 
 
@@ -25,7 +27,7 @@ class Residual(nn.Module):
     def forward(self, x, **kwargs):
         return self.fn(x, **kwargs) + x
 
-# PreNorm
+# 等于 PreNorm
 class LayerNormalize(nn.Module):
     def __init__(self, dim, fn):
         super().__init__()
@@ -35,7 +37,20 @@ class LayerNormalize(nn.Module):
     def forward(self, x, **kwargs):
         return self.fn(self.norm(x), **kwargs)
 
-# FeedForward
+class Dyt(nn.Module):
+    def __init__(self,dim,num_tokens=10):
+        super().__init__()
+        self.init_a = nn.Parameter(torch.empty(64, 1, (num_tokens+1)))
+        self.Alpha = nn.Parameter(torch.ones(64,64,1))
+        self.Beta = nn.Parameter(torch.zeros(64,(num_tokens+1),64))
+        self.Gamma = nn.Parameter(torch.ones(64,(num_tokens+1),64))
+
+    def forward(self, x):
+        x = torch.tanh(torch.einsum('bij,bjk->bik',self.Alpha, x))
+        y = torch.einsum('bij,bjk->bik',self.Gamma, x)
+        return y + self.Beta
+
+# 等于 FeedForward
 class MLP_Block(nn.Module):
     def __init__(self, dim, hidden_dim, dropout=0.1):
         super().__init__()
@@ -49,6 +64,49 @@ class MLP_Block(nn.Module):
 
     def forward(self, x):
         return self.net(x)
+
+
+class DecayPos1d(nn.Module):
+
+    def __init__(self, embed_dim, num_heads, initial_value, heads_range):
+        '''
+        recurrent_chunk_size: (clh clw)
+        num_chunks: (nch ncw)
+        clh * clw == cl
+        nch * ncw == nc
+
+        default: clh==clw, clh != clw is not implemented
+        '''
+        super().__init__()
+        angle = 1.0 / (10000 ** torch.linspace(0, 1, embed_dim // num_heads // 2))
+        angle = angle.unsqueeze(-1).repeat(1, 2).flatten()
+        self.initial_value = initial_value
+        self.heads_range = heads_range
+        self.num_heads = num_heads
+        decay = torch.log(
+            1 - 2 ** (-initial_value - heads_range * torch.arange(num_heads, dtype=torch.float) / num_heads))
+        self.register_buffer('angle', angle)
+        self.register_buffer('decay', decay)
+
+    def generate_1d_decay(self, l: int):
+        '''
+        generate 1d decay mask, the result is l*l
+        '''
+        index = torch.arange(l).to(self.decay)
+        mask = index[:, None] - index[None, :]  # (l l)
+        mask = mask.abs()  # (l l)
+        mask = mask * self.decay[:, None, None]  # (n l l)
+        return mask
+
+    def forward(self, slen):
+        '''
+        slen: (c)
+        recurrent is not implemented
+        '''
+        mask_c = self.generate_1d_decay(slen)
+        retention_rel_pos = mask_c
+
+        return retention_rel_pos
 
 class Attention(nn.Module):
 
@@ -66,7 +124,9 @@ class Attention(nn.Module):
         # torch.nn.init.zeros_(self.nn1.bias)
         self.do1 = nn.Dropout(dropout)
 
-    def differential_attention(self, scores):##difference calculation
+        self.realPos = DecayPos1d(64, heads, 2, 4)
+
+    def differential_attention(self, scores):##差分计算
         diff_scores = scores[:, 1:] - scores[:, :-1]
         pld = (0,0,0,0,1,0)#torch.Size([64, 8, 5, 5])
         diff_scores = torch.nn.functional.pad(diff_scores, pld, 'constant',0)
@@ -75,7 +135,7 @@ class Attention(nn.Module):
     def forward(self, x, mask=None):
 
         b, n, _, h = *x.shape, self.heads
-        qkv = self.to_qkv(x).chunk(3, dim = -1)  # gets q = Q = Wq matmul x1, k = Wk mm x2, v = Wv mm x3,dim=-1，
+        qkv = self.to_qkv(x).chunk(3, dim = -1)  # gets q = Q = Wq matmul x1, k = Wk mm x2, v = Wv mm x3,dim=-1，一般是最后一维。
         q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> b h n d', h=h), qkv)  # split into multi head attentions
 
         dots1 = torch.einsum('bhid,bhjd->bhij', q, k) * self.scale ##torch.Size([64, 8, 5, 5])
@@ -90,12 +150,30 @@ class Attention(nn.Module):
             dots.masked_fill_(~mask, float('-inf'))
             del mask
         S = dots[:,0] ##torch.Size([64, 5, 5])
-        m = nn.Softplus()
+        # S = torch.tanh_(S) ##torch.Size([64, 5, 5])
+        m = nn.Mish()
         S = m(S)
-        S = torch.roll(S, 1, -2)
-        F1 = torch.cumsum(S,dim=-2)
-        dots = dots - F1[:,None]
+        # m = nn.Softplus()
+        # S = m(S)
+        # m = nn.Softshrink()
+        # S = m(S)
+        # m = nn.Tanhshrink()
+        # S = m(S)
+        # m = nn.ReLU()
+        # S = m(S)
+        # m = nn.SiLU()
+        # S = m(S)
+        # S[...,0] = 0
+        # S = (1-torch.eye(n))*S
+        S2 = torch.roll(S, 1, -2)
+        # S[..., 0, :] = 0
+        F1 = torch.cumsum(S2,dim=-2)
+        # dots = m(dots)
+        F2 = F1[:,None]
+        dots = dots - F2
         attn = dots.softmax(dim=-1)  # follow the softmax,q,d,v equation in the paper
+        # realPos = self.realPos(24 / self.heads)
+        # attn = self.add_3d_from_4d_torch(attn,realPos)
 
         out = torch.einsum('bhij,bhjd->bhid', attn, v)  # product of v times whatever inside softmax
         out = rearrange(out, 'b h n d -> b n (h d)')  # concat heads into one matrix, ready for next encoder block
@@ -109,13 +187,16 @@ class Transformer(nn.Module):
         self.layers = nn.ModuleList([])
         for _ in range(depth):
             self.layers.append(nn.ModuleList([
-                Residual(LayerNormalize(dim, Attention(dim, heads=heads, dropout=dropout))),
+                Residual(LayerNormalize(dim, Attention(dim, heads=heads, dropout=dropout))),#64 11 64
                 Residual(LayerNormalize(dim, MLP_Block(dim, mlp_dim, dropout=dropout)))
+                # Residual(Dyt(Attention(dim, heads=heads, dropout=dropout))),
+                # Residual(Dyt(MLP_Block(dim, mlp_dim, dropout=dropout))),
             ]))
 
         self.skipcat = nn.ModuleList([])
         for _ in range(depth - 2):
-            self.skipcat.append(nn.Conv2d(num_channel + 1, num_channel + 1, [1, 2], 1, 0))
+            self.skipcat.append(nn.Conv2d(num_channel + 1, num_channel + 1, [1, 2], 1, 0)) #原版
+            # self.skipcat.append(nn.Conv2d(num_channel + 1, num_channel + 1, [1, 2], 1, 0))
 
     def forward(self, x, mask=None):
         last_output = []
@@ -124,8 +205,9 @@ class Transformer(nn.Module):
             last_output.append(x)
             if nl > 1:
                 x = self.skipcat[nl - 2](torch.cat([x.unsqueeze(3), last_output[nl - 2].unsqueeze(3)], dim=3)).squeeze(
-                    3)
+                    3)#跳接
             x = attention(x, mask=mask)  # go to attention
+            # x = attention(x)  # go to attention
             x = mlp(x)  # go to MLP_Block
         return x
 
@@ -133,11 +215,12 @@ class Transformer(nn.Module):
 NUM_CLASS = 16
 # NUM_CLASS = 15
 # NUM_CLASS = 13
+# NUM_CLASS = 22
 
-class BFSSFormernet(nn.Module):
+class SSFTTnet(nn.Module):
     def __init__(self, in_channels=1, num_classes=NUM_CLASS, num_tokens=10, dim=64, depth=1, heads=8, mlp_dim=8, dropout=0.1, emb_dropout=0.1,num_channel=1):
     # def __init__(self, in_channels=1, num_classes=NUM_CLASS, num_tokens=4, dim=64, depth=3, heads=8, mlp_dim=8, dropout=0.1, emb_dropout=0.1, num_channel=1):
-        super(BFSSFormernet, self).__init__()
+        super(SSFTTnet, self).__init__()
         self.L = num_tokens
         self.cT = dim
         self.scale = dim ** -1/2
@@ -149,7 +232,7 @@ class BFSSFormernet(nn.Module):
         )
 
         self.conv2d_features = nn.Sequential(
-            nn.Conv2d(in_channels=8*28, out_channels=64, kernel_size=(3, 3)),
+            nn.Conv2d(in_channels=224, out_channels=64, kernel_size=(3, 3)),
             nn.BatchNorm2d(64),
             nn.ReLU(),
         )
@@ -165,6 +248,28 @@ class BFSSFormernet(nn.Module):
             nn.BatchNorm2d(64),
             nn.ReLU(),
         )
+
+        self.unmix_encoder = nn.Sequential(
+            nn.Conv2d(64, 15, kernel_size=(3, 3), stride=1, padding=1),
+            # 步幅：卷积核经过输入特征图的采样间隔，希望减小输入参数的数目，减少计算量
+            # 填充：填充：在输入特征图的每一边添加一定数目的行列，使得输出的特征图的长、宽 = 输入的特征图的长、宽
+            nn.BatchNorm2d(15, affine=True),
+            # 在卷积层之后和激活函数之前，BatchNorm2d的主要作用是通过减少内部协变量偏移来加速网络的训练，并提高模型的泛化能力。
+            nn.ReLU(),
+
+            nn.Conv2d(15, 7, kernel_size=(3, 3), stride=1, padding=1),
+            nn.BatchNorm2d(7, affine=True),
+            nn.ReLU(),
+
+            nn.Conv2d(7, num_classes, kernel_size=(3, 3), stride=1, padding=1),
+            nn.Softmax(dim=1)
+        )  # 编码器，包含3个1*1的卷积
+
+        self.conv = nn.Sequential(
+            nn.Conv2d(64, 64, kernel_size=(1,1)),
+            nn.BatchNorm2d(64),
+            nn.ReLU(),
+        )  # 3*3大小卷积核，
 
         # Tokenization
         self.token_wA = nn.Parameter(torch.empty(1, self.L, 64),
@@ -213,6 +318,7 @@ class BFSSFormernet(nn.Module):
 
         wa = rearrange(self.token_wA, 'b h w -> b w h')  # Transpose
         A = torch.einsum('bij,bjk->bik', x, wa) * self.scale
+        # A = torch.einsum('bij,bjk->bik', x, wa)
         A = rearrange(A, 'b h w -> b w h')  # Transpose
         A = A.softmax(dim=-1)
 
@@ -241,17 +347,23 @@ class BFSSFormernet(nn.Module):
         return FusedFeatures
         # return x
 
+# def preprocess_image(img: np.ndarray, mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]) -> torch.Tensor:
+#     preprocessing = Compose([
+#         ToTensor(),
+#         Normalize(mean=mean, std=std)
+#     ])
+#     return preprocessing(img.copy()).unsqueeze(0)
 
 if __name__ == '__main__':
     model1 = Attention(dim=64)
     model1.eval()
     print(model1)
-    model = BFSSFormernet()
+    model = SSFTTnet()
     model.eval()
     print(model)
-    input = torch.randn(64, 1, 30, 15, 15)
-    # flops, params = profile(model,(input,))
-    # print('flops: ', str(flops/1000**3) + 'G', 'params: ', str(params/1000**2) + 'M')
+    input = torch.randn(60, 1, 30, 19, 19)
+    flops, params = profile(model,(input,))
+    print('flops: ', str(flops/1024**3) + 'G', 'params: ', str(params/1024**2) + 'M')
     y = model(input)
     print(y.size())
 
