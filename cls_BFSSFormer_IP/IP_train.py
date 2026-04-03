@@ -13,10 +13,12 @@ import cls_BFSSFormer_IP.BFSSFormer
 
 def loadData():
     #load the datasets after Band grouping fusion
-    data = sio.loadmat('..\BFdata\img2.mat')['img2']
+    #data = sio.loadmat('..\BFdata\img2.mat')['img2']
     #no Band grouping fusion
     # BFdata = sio.loadmat('..\BFdata\Indian_pines_corrected.mat')['indian_pines_corrected']
-    labels = sio.loadmat('..\BFdata\Indian_pines_gt.mat')['indian_pines_gt']
+    #labels = sio.loadmat('..\BFdata\Indian_pines_gt.mat')['indian_pines_gt']
+    data = sio.loadmat('..\BFdata\imghc.mat')['imghc']
+    labels = sio.loadmat('..\BFdata\WHU_Hi_HanChuan_gt.mat')['WHU_Hi_HanChuan_gt']
 
     return data, labels
 
@@ -70,28 +72,36 @@ def splitTrainTestSet(X, y, testRatio, randomState=345):
 
     return X_train, X_test, y_train, y_test
 
-# BATCH_SIZE_TRAIN = 64 #for ksc
-BATCH_SIZE_TRAIN = 64 #for ip
+# BATCH_SIZE_TRAIN = 80 #for ksc on 2.5% and 3%
+# BATCH_SIZE_TRAIN = 64 #for ksc on other data
+# BATCH_SIZE_TRAIN = 64 #for ip
 # BATCH_SIZE_TRAIN = 128 #for ho
 # BATCH_SIZE_TRAIN = 128 #LK
-# BATCH_SIZE_TRAIN = 64 #SSFTT
+# BATCH_SIZE_TRAIN = 40 #SA
+BATCH_SIZE_TRAIN = 60 #HC
+# BATCH_SIZE_TRAIN = 64 #pu
 
 def create_data_loader():
     # Classes
     # class_num = 15  #numbersamples=15029 HO
-    class_num = 16   #numbersamples=10249 IP
-    # class_num = 9 # numbersamples=204542 LK
+    class_num = 16   #numbersamples=10249 IP numbersamples=54129 sa numbersamples=257530 hc
+    # class_num = 9 # numbersamples=204542 LK numbersamples=42276
     # class_num = 13 #numbersamples=5211 ksc
+    # class_num = 22 #numbersamples=386693 hh
     # loading datasets
     X, y = loadData()
     # test ratio for all four datasets
-    test_ratio = 0.9
-    # patch size
-    patch_size = 15 #IP
+    test_ratio = 0.999689356
+    # 每个像素周围提取 patch 的尺寸
+    # patch_size = 13 #IP
     # patch_size = 25  # KSC
-    # patch_size = 11 #LK
-    # patch_size = 13 # SSFTT
+    # patch_size = 11 #LK patch_size=11
+    # patch_size = 31 # SA
+    patch_size = 19  # HC
     # patch_size = 11 # HO
+    # patch_size = 17  # pu
+    # patch_size = 13  # hh
+    # patch_size = 13  # test
     pca_components = 30
 
     print('Hyperspectral BFdata shape: ', X.shape)
@@ -252,6 +262,15 @@ def acc_reports(y_test, y_pred_test):
                     'Stone-Steel-Towers']
     # target_names = ['Healthy-grass','Stressed-grass','Synthetic-grass','Trees','Soil','Water','Residential','Commercial',
     #                 'Road','Highway','Railway','Parking-Lot 1','Parking-Lot 2','Tennis-Court','Running-Track']
+    # target_names = ['Brocoli_green_weeds_1','Brocoli_green_weeds_2','Fallow','Fallow_rough_plow','Fallow_smooth',
+    #                     'Stubble','Celery','Grapes_untrained','Soil_vinyard_develop','Corn_senesced_green_weeds',
+    #                     'Lettuce_romaine_4wk','Lettuce_romaine_5wk','Lettuce_romaine_6wk','Lettuce_romaine_7wk',
+    #                     'Vinyard_untrained','Vinyard_vertical_trellis']
+    # target_names = ['Red roof', 'Road', 'Bare soil', 'Cotton', 'Cotton firewood',
+    #                 'Rape', 'Chinese cabbage', 'Pakchoi', 'Cabbage', 'Tuber mustard',
+    #                 'Brassica parachinensis', 'Brassica chinensis', 'Small Brassica chinensis', 'Lactuca sativa',
+    #                 'Celtuce', 'Film-covered lettuce','Romaine','Carrot','White radish','Garlic sprout',
+    #                 'Broad bean','Tree']
     classification = classification_report(y_test, y_pred_test, digits=4, target_names=target_names)
     oa = accuracy_score(y_test, y_pred_test)
     confusion = confusion_matrix(y_test, y_pred_test)
@@ -265,10 +284,13 @@ if __name__ == '__main__':
     train_loader, test_loader, all_data_loader, y_all= create_data_loader()
     tic1 = time.perf_counter()
     # net, device = train(train_loader, epochs=150)#ho
-    # net, device = train(train_loader, epochs=100)  # SSFTT
+    # net, device = train(train_loader, epochs=100)  # pu
+    net, device = train(train_loader, epochs=150)  # hc
     # net, device = train(train_loader, epochs=100) #LK
+    # net, device = train(train_loader, epochs=100)#SA
     # net, device = train(train_loader, epochs=150)  # ksc
-    net, device = train(train_loader, epochs=150)#ip
+    # net, device = train(train_loader, epochs=100)#ip
+    # net, device = train(train_loader, epochs=150)  # HH
     print('cliqueNet parameters:', sum(param.numel() for param in net.parameters()))
     # save params
     torch.save(net.state_dict(), '..\cls_BFSSFormer_IP\cls_params\BFSSFormer_params.pth')
